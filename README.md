@@ -90,348 +90,272 @@ Safety: If the LLM overshoots the target token budget, a final guard compresses 
 
 ---
 
-## 5. TypeScript Reference Implementation
+## 5. TypeScript Reference Implementation (Functional -  No Classes)
 
-Below is a compact TypeScript implementation of the core data types and control loop. It is framework‑agnostic: plug in your tokenizer, LLM client, and persistence.
+Below is a purely functional implementation: no classes, only functions that accept and return immutable state objects. This makes behavior explicit, easy to test, and simple to serialize.
 
 ```ts
-// tri-tier-memory.ts
+// tri-tier-memory.functional.ts
 
-// ----- Types -----
-export interface Tokenizer {
-  count(text: string): number;
-}
+/**
+ * WHAT: A functional, production-oriented 3-tier memory manager for LLM apps.
+ * WHY: Preserve long-horizon continuity while respecting strict token budgets.
+ * HOW: Split into New (N_t), Current (C_t), Old (O_t); use tier-aware LLM trimming,
+ *      deterministic scored selection into C_t, and manifest-only archive in O_t.
+ */
 
-export interface LLMTrimPayload {
-  system: string;
-  user: string;
-  targetTokens: number;
-  tier: "NEW" | "CURRENT" | "OLD";
-  aggressiveness: "high" | "medium" | "low";
-}
+// ---------- Types ----------
+export type Tier = "NEW" | "CURRENT" | "OLD";
+export type Aggressiveness = "high" | "medium" | "low";
 
-export type LLMFn = (p: LLMTrimPayload) => Promise<{ trimmed: string; removed_notes?: string[] } | string>;
-
+export interface Tokenizer { count(text: string): number }
 export interface MemoryItem {
-  id: string;
-  content: string;
-  tags: string[];
+  id: string; content: string; tags: string[];
   userPriority: number; // 0..1
   dependencies: string[];
-  createdTs: number;
-  lastTouchedTs: number;
-  lastTouchedTurn: number;
-  frequency: number;
-  trimNotes?: string[];
+  createdTs: number; lastTouchedTs: number; lastTouchedTurn: number;
+  frequency: number; trimNotes?: string[];
 }
-
 export interface EpisodeManifest {
-  episodeId: string;
-  topic: string;
-  dateRange: [string, string]; // ISO dates
-  summary256: string;
-  salienceTags: string[];
-  links: string[]; // external refs/IDs
-  rehydrationHints: string[];
-  sizeEstimateTokens: number;
-  createdTs: number;
-  lastUpdatedTs: number;
+  episodeId: string; topic: string; dateRange: [string,string];
+  summary256: string; salienceTags: string[]; links: string[];
+  rehydrationHints: string[]; sizeEstimateTokens: number;
+  createdTs: number; lastUpdatedTs: number;
+}
+export interface Budgets { B_total: number; B_N: number; B_C: number; B_sys: number }
+export interface ScoringWeights { w_recency: number; w_frequency: number; w_user_priority: number; w_dependency: number; w_size: number }
+
+export interface State {
+  turnIdx: number;
+  N: MemoryItem[]; C: MemoryItem[]; O: EpisodeManifest[];
+  budgets: Budgets; tok: Tokenizer; w: ScoringWeights;
+  ttlTurns: number;
+  trimFn: (content: string, targetTokens: number, tier: Tier, aggr: Aggressiveness) => Promise<{ text: string, notes: string[] }>
 }
 
-export interface Budgets {
-  B_total: number;
-  B_N: number;
-  B_C: number;
-  B_sys: number;
+// ---------- Defaults ----------
+function wordCountSpacesOnly(s: string): number {
+  if (!s) return 0;
+  const parts = s.trim().split(' ').filter(Boolean);
+  return parts.length;
 }
-
+export const defaultTokenizer: Tokenizer = { count: wordCountSpacesOnly };
+export const defaultWeights: ScoringWeights = { w_recency: 0.40, w_frequency: 0.20, w_user_priority: 0.25, w_dependency: 0.20, w_size: 0.15 };
 export function budgetsFromTotal(B_total: number, fracN = 0.2, fracC = 0.6): Budgets {
-  const B_N = Math.floor(B_total * fracN);
-  const B_C = Math.floor(B_total * fracC);
-  const B_sys = B_total - B_N - B_C;
-  return { B_total, B_N, B_C, B_sys };
+  const B_N = Math.floor(B_total * fracN), B_C = Math.floor(B_total * fracC);
+  return { B_total, B_N, B_C, B_sys: B_total - B_N - B_C };
 }
 
-export interface ScoringWeights {
-  w_recency: number;
-  w_frequency: number;
-  w_user_priority: number;
-  w_dependency: number;
-  w_size: number; // subtracted
-}
+// ---------- Utilities ----------
+const uid = () => (globalThis.crypto && 'randomUUID' in globalThis.crypto ? (globalThis.crypto as any).randomUUID() : `${Date.now()}-${Math.random()}`);
+const nowSec = () => Math.floor(Date.now()/1000);
+const clamp = (x: number, lo=0, hi=1) => Math.max(lo, Math.min(hi, x));
+const NL = String.fromCharCode(10);
+const isoDate = () => new Date().toISOString().slice(0,10);
+const tokens = (tok: Tokenizer, items: MemoryItem[]) => items.reduce((s,x)=>s+tok.count(x.content),0);
+const uniq = (items: MemoryItem[]) => { const s = new Set<string>(); const out: MemoryItem[]=[]; for (const it of items){ if(!s.has(it.id)){ s.add(it.id); out.push(it);} } return out; };
+function naiveSummarize(tok: Tokenizer, text: string, target: number){ if (tok.count(text) <= target) return text; const words = text.split(' '); return words.slice(0, Math.max(1,target)).join(' '); }
 
-export const defaultWeights: ScoringWeights = {
-  w_recency: 0.40,
-  w_frequency: 0.20,
-  w_user_priority: 0.25,
-  w_dependency: 0.20,
-  w_size: 0.15,
-};
-
-// ----- Utilities -----
-function uid() { return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`; }
-function nowSec() { return Math.floor(Date.now() / 1000); }
-function clamp(x: number, lo = 0, hi = 1) { return Math.max(lo, Math.min(hi, x)); }
-
-export const defaultTokenizer: Tokenizer = {
-  count(text: string) { return text ? (text.trim().split(/\s+/).length) : 0; }
-};
-
-// Naive summarizer as last-ditch guard (if LLM overshoots or is absent)
-function naiveSummarize(text: string, target: number, tok: Tokenizer): string {
-  if (tok.count(text) <= target) return text;
-  const words = text.split(/\s+/);
-  return words.slice(0, Math.max(1, target)).join(" ");
-}
-
-// ----- LLM Trimmer -----
-export class LLMTrimmer {
-  constructor(private llmFn: LLMFn | null, private tok: Tokenizer = defaultTokenizer) {}
-
-  system = `You are a careful memory-trimmer for a conversation.\n` +
-           `- Keep FACTS, bindings (entities, IDs), active tasks and constraints.\n` +
-           `- Remove fluff, repetition, and boilerplate. Do not invent.\n` +
-           `- Fit within TARGET_TOKENS with ~5% headroom.\n` +
-           `Return JSON: {"trimmed":"...","removed_notes":["..."]}`;
-
-  userTemplate(tier: "NEW"|"CURRENT"|"OLD", aggr: "high"|"medium"|"low", target: number, content: string) {
-    return `Tier: ${tier} | Aggressiveness: ${aggr}\nTarget tokens: ${target}\n` +
-           `Guidelines:\n- NEW: dedupe aggressively; compress verbose wording.\n` +
-           `- CURRENT: preserve nuance and references; merge repeats.\n` +
-           `- OLD: produce a compact MANIFEST (summary + salient tags); no raw log.\n\n` +
-           `Input:\n${content}`;
+function toWordsLowerASCII(text: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  const lower = (text || '').toLowerCase();
+  for (let i=0; i<lower.length; i++){
+    const c = lower.charCodeAt(i);
+    const isAZ = c >= 97 && c <= 122; // a-z
+    const is09 = c >= 48 && c <= 57;  // 0-9
+    if (isAZ || is09){ cur += lower[i]; }
+    else { if (cur) { out.push(cur); cur = ''; } }
   }
+  if (cur) out.push(cur);
+  return out;
+}
 
-  async trim(content: string, targetTokens: number, tier: "NEW"|"CURRENT"|"OLD", aggr: "high"|"medium"|"low"): Promise<{text: string, notes: string[]}> {
-    if (!this.llmFn) {
-      return { text: naiveSummarize(content, targetTokens, this.tok), notes: [] };
-    }
-    const payload: LLMTrimPayload = {
-      system: this.system,
-      user: this.userTemplate(tier, aggr, targetTokens, content),
-      targetTokens, tier, aggressiveness: aggr,
-    };
+// ---------- LLM Trim (functional adapter) ----------
+export function makeTrimFn(
+  tok: Tokenizer,
+  llm: (payload: { system: string; user: string; targetTokens: number; tier: Tier; aggressiveness: Aggressiveness }) => Promise<{ trimmed: string; removed_notes?: string[] }|string> | null
+) {
+  const system = [
+    'You are a careful memory-trimmer for a conversation.',
+    '- Keep FACTS, bindings (entities, IDs), active tasks and constraints.',
+    '- Remove fluff, repetition, and boilerplate. Do not invent.',
+    '- Fit within TARGET_TOKENS with ~5% headroom.',
+    'Return JSON: {"trimmed":"...","removed_notes":["..."]}'
+  ].join(NL);
+
+  const userTmpl = (tier: Tier, aggr: Aggressiveness, target: number, content: string) => [
+    `Tier: ${tier} | Aggressiveness: ${aggr}`,
+    `Target tokens: ${target}`,
+    'Guidelines:',
+    '- NEW: dedupe aggressively; compress verbose wording.',
+    '- CURRENT: preserve nuance and references; merge repeats.',
+    '- OLD: compact MANIFEST (summary + salient tags); no raw log.',
+    '',
+    'Input:',
+    content
+  ].join(NL);
+
+  return async (content: string, targetTokens: number, tier: Tier, aggr: Aggressiveness) => {
+    if (!llm) return { text: naiveSummarize(tok, content, targetTokens), notes: [] };
     try {
-      const res = await this.llmFn(payload);
-      let text = typeof res === "string" ? res : (res.trimmed ?? "");
-      const notes = typeof res === "string" ? [] : (res.removed_notes ?? []);
-      if (this.tok.count(text) > targetTokens) {
-        text = naiveSummarize(text, targetTokens, this.tok);
-      }
-      return { text, notes };
+      const payload = { system, user: userTmpl(tier, aggr, targetTokens, content), targetTokens, tier, aggressiveness: aggr };
+      const res = await llm(payload);
+      const text = typeof res === 'string' ? res : (res.trimmed ?? '');
+      const notes = typeof res === 'string' ? [] : (res.removed_notes ?? []);
+      const bounded = tok.count(text) > targetTokens ? naiveSummarize(tok, text, targetTokens) : text;
+      return { text: bounded, notes };
     } catch {
-      return { text: naiveSummarize(content, targetTokens, this.tok), notes: [] };
+      return { text: naiveSummarize(tok, content, targetTokens), notes: [] };
     }
-  }
+  };
 }
 
-// ----- Memory Manager -----
-export class MemoryManager {
-  private turnIdx = 0;
-  private N: MemoryItem[] = [];
-  private C: MemoryItem[] = [];
-  private O: EpisodeManifest[] = [];
+// ---------- Scoring ----------
+const recencyScore = (turnIdx: number, it: MemoryItem) => Math.exp(-0.35 * Math.max(0, turnIdx - it.lastTouchedTurn));
+const dependencyScore = (C: MemoryItem[], it: MemoryItem) => {
+  if (!it.dependencies?.length) return 0; const ids = new Set(C.map(x=>x.id));
+  const ok = it.dependencies.filter(d=>ids.has(d)).length; return clamp(ok / it.dependencies.length);
+};
+const sizePenalty = (tok: Tokenizer, it: MemoryItem) => clamp(tok.count(it.content) / 200);
+export const score = (state: State, it: MemoryItem) =>
+  state.w.w_recency * recencyScore(state.turnIdx, it)
++ state.w.w_frequency * clamp(it.frequency / 5)
++ state.w.w_user_priority * clamp(it.userPriority)
++ state.w.w_dependency * dependencyScore(state.C, it)
+- state.w.w_size * sizePenalty(state.tok, it);
 
-  constructor(
-    private budgets: Budgets,
-    private tok: Tokenizer = defaultTokenizer,
-    private w: ScoringWeights = defaultWeights,
-    private ttlTurns = 8,
-    private trimmer = new LLMTrimmer(null, defaultTokenizer),
-  ) {}
+// ---------- Core helpers ----------
+export const ingest = (state: State, blocks: string[], tags: string[] = []): MemoryItem[] => {
+  const out: MemoryItem[]=[]; for (const b of blocks){ if(!b||!b.trim()) continue; out.push({
+    id: uid(), content: b.trim(), tags: [...tags], userPriority: 0, dependencies: [],
+    createdTs: nowSec(), lastTouchedTs: nowSec(), lastTouchedTurn: state.turnIdx, frequency: 1, trimNotes: []
+  }) } return out;
+};
 
-  private tokens(items: MemoryItem[]) { return items.reduce((s, x) => s + this.tok.count(x.content), 0); }
+export async function llmTrimItems(state: State, items: MemoryItem[], B: number, tier: Tier, aggr: Aggressiveness): Promise<MemoryItem[]> {
+  let copy = items.map(x=>({ ...x }));
+  const tk = (x: MemoryItem) => state.tok.count(x.content);
+  const total = () => copy.reduce((s,x)=>s+tk(x),0);
+  if (total() <= B) return copy;
 
-  private ingest(blocks: string[], tags: string[] = []): MemoryItem[] {
-    const out: MemoryItem[] = [];
-    for (const b of blocks) {
-      if (!b || !b.trim()) continue;
-      out.push({
-        id: uid(), content: b.trim(), tags: [...tags], userPriority: 0,
-        dependencies: [], createdTs: nowSec(), lastTouchedTs: nowSec(),
-        lastTouchedTurn: this.turnIdx, frequency: 1, trimNotes: []
-      });
-    }
-    return out;
+  copy.sort((a,b)=>tk(b)-tk(a));
+  for (const it of copy){
+    if (total() <= B) break;
+    const overshoot = total() - B;
+    const target = Math.max(1, tk(it) - Math.max(1, Math.floor(overshoot / 2)));
+    const { text, notes } = await state.trimFn(it.content, target, tier, aggr);
+    it.content = text; it.trimNotes = [...(it.trimNotes||[]), ...notes];
   }
-
-  private uniq(items: MemoryItem[]) {
-    const seen = new Set<string>();
-    const out: MemoryItem[] = [];
-    for (const it of items) { if (!seen.has(it.id)) { seen.add(it.id); out.push(it); } }
-    return out;
-  }
-
-  private recencyScore(it: MemoryItem) {
-    const dt = Math.max(0, this.turnIdx - it.lastTouchedTurn);
-    return Math.exp(-0.35 * dt);
-  }
-
-  private dependencyScore(it: MemoryItem) {
-    if (!it.dependencies?.length) return 0;
-    const idsInC = new Set(this.C.map(x => x.id));
-    const ok = it.dependencies.filter(d => idsInC.has(d)).length;
-    return clamp(ok / it.dependencies.length);
-  }
-
-  private sizePenalty(it: MemoryItem) {
-    return clamp(this.tok.count(it.content) / 200);
-  }
-
-  private score(it: MemoryItem) {
-    return this.w.w_recency * this.recencyScore(it)
-         + this.w.w_frequency * clamp(it.frequency / 5)
-         + this.w.w_user_priority * clamp(it.userPriority)
-         + this.w.w_dependency * this.dependencyScore(it)
-         - this.w.w_size * this.sizePenalty(it);
-  }
-
-  private async llmTrimItems(items: MemoryItem[], B: number, tier: "NEW"|"CURRENT"|"OLD", aggr: "high"|"medium"|"low"): Promise<MemoryItem[]> {
-    const copy = items.map(x => ({ ...x }));
-    const tk = (x: MemoryItem) => this.tok.count(x.content);
-    if (copy.reduce((s, x) => s + tk(x), 0) <= B) return copy;
-
-    copy.sort((a, b) => tk(b) - tk(a));
-    const total = () => copy.reduce((s, x) => s + tk(x), 0);
-
-    for (const it of copy) {
-      if (total() <= B) break;
-      const overshoot = total() - B;
-      const target = Math.max(1, tk(it) - Math.max(1, Math.floor(overshoot / 2)));
-      const { text, notes } = await this.trimmer.trim(it.content, target, tier, aggr);
-      it.content = text; it.trimNotes = [...(it.trimNotes || []), ...notes];
-    }
-
-    if (total() > B) {
-      const ratio = B / Math.max(1, total());
-      for (const it of copy) {
-        const target = Math.max(1, Math.floor(tk(it) * ratio));
-        if (tk(it) > target) {
-          const { text, notes } = await this.trimmer.trim(it.content, target, tier, aggr);
-          it.content = text; it.trimNotes = [...(it.trimNotes || []), ...notes];
-        }
+  if (total() > B){
+    const ratio = B / Math.max(1, total());
+    for (const it of copy){
+      const target = Math.max(1, Math.floor(tk(it)*ratio));
+      if (tk(it) > target){
+        const { text, notes } = await state.trimFn(it.content, target, tier, aggr);
+        it.content = text; it.trimNotes = [...(it.trimNotes||[]), ...notes];
       }
     }
-
-    // Prefix-pack if still too big
-    const out: MemoryItem[] = [];
-    let running = 0;
-    for (const it of copy) {
-      const t = tk(it);
-      if (running + t > B) break;
-      out.push(it); running += t;
-    }
-    return out;
   }
-
-  private async retrieveFromO(query: string, k = 5): Promise<EpisodeManifest[]> {
-    const bag = new Set((query || "").toLowerCase().match(/\w+/g) || []);
-    const scored = this.O.map(m => {
-      const text = [m.topic, m.summary256, ...m.salienceTags, ...m.rehydrationHints].join(" ").toLowerCase();
-      const words = new Set(text.match(/\w+/g) || []);
-      let overlap = 0; for (const w of words) if (bag.has(w)) overlap++;
-      return { m, s: overlap };
-    }).sort((a, b) => b.s - a.s);
-    return scored.filter(x => x.s > 0).slice(0, k).map(x => x.m);
-  }
-
-  private async manifestFromItems(items: MemoryItem[], topicHint = ""): Promise<EpisodeManifest> {
-    const iso = () => new Date().toISOString().slice(0, 10);
-    const concat = items.map(x => x.content).join("\n\n");
-    const { text } = await this.trimmer.trim(concat, 256, "OLD", "high");
-    const tags = Array.from(new Set(items.flatMap(x => x.tags))).sort();
-    const size = items.reduce((s, x) => s + this.tok.count(x.content), 0);
-    return {
-      episodeId: uid(), topic: topicHint || (tags[0] || "episode"),
-      dateRange: [iso(), iso()], summary256: text, salienceTags: tags,
-      links: [], rehydrationHints: tags.slice(0, 8), sizeEstimateTokens: size,
-      createdTs: nowSec(), lastUpdatedTs: nowSec(),
-    };
-  }
-
-  private async archiveEvicted(evicted: MemoryItem[], topicHint = "") {
-    if (!evicted.length) return;
-    const m = await this.manifestFromItems(evicted, topicHint);
-    this.O.push(m);
-  }
-
-  // ----- Public API -----
-  async turn(params: {
-    userMsg?: string;
-    toolOutputs?: string[];
-    query?: string;
-    pullFromO?: boolean;
-    kRetrieve?: number;
-    topicHint?: string;
-  }): Promise<{ N: MemoryItem[]; C: MemoryItem[]; O: EpisodeManifest[]; forLLM: string; }> {
-    this.turnIdx += 1;
-    const userMsg = params.userMsg ?? "";
-    const toolOutputs = params.toolOutputs ?? [];
-    const query = params.query ?? "";
-    const pullFromO = params.pullFromO ?? true;
-    const kRetrieve = params.kRetrieve ?? 4;
-    const topicHint = params.topicHint ?? "";
-
-    // 1) Ingest → N_t
-    let N = this.ingest([userMsg, ...toolOutputs]);
-    for (const n of N) { n.lastTouchedTurn = this.turnIdx; n.lastTouchedTs = nowSec(); n.frequency++; }
-    N = await this.llmTrimItems(N, this.budgets.B_N, "NEW", "high");
-
-    // 2) Optional rehydration from O
-    if (pullFromO && query) {
-      const manifests = await this.retrieveFromO(query, kRetrieve);
-      if (manifests.length) {
-        const text = manifests.map(m => `[${m.topic}] ${m.summary256}`).join("\n");
-        const R = this.ingest([text], ["rehydrated"]);
-        N = await this.llmTrimItems([...N, ...R], this.budgets.B_N, "NEW", "high");
-      }
-    }
-
-    // 3) Merge → C_t (TTL + scored pack)
-    const candidates = this.uniq([...this.C, ...N]).filter(it => it.userPriority >= 1 || (this.turnIdx - it.lastTouchedTurn) <= this.ttlTurns);
-    const sorted = [...candidates].sort((a, b) => this.score(b) - this.score(a));
-    const packed: MemoryItem[] = [];
-    let used = 0;
-    for (const it of sorted) {
-      const t = this.tok.count(it.content);
-      if (used + t <= this.budgets.B_C) { packed.push(it); used += t; }
-    }
-    let C = packed;
-    if (used > this.budgets.B_C) {
-      C = await this.llmTrimItems(packed, this.budgets.B_C, "CURRENT", "low");
-    }
-
-    // 4) Evict & archive manifests
-    const prevIds = new Set(this.C.map(x => x.id));
-    const nextIds = new Set(C.map(x => x.id));
-    const evicted = this.C.filter(x => !nextIds.has(x.id));
-    await this.archiveEvicted(evicted, topicHint);
-
-    this.N = N; this.C = C;
-
-    const forLLM = [...this.C, ...this.N].map(x => x.content).join("\n\n");
-    return { N: this.N, C: this.C, O: this.O, forLLM };
-  }
-
-  async pin(id: string, priority = 1): Promise<boolean> {
-    for (const it of [...this.C, ...this.N]) { if (it.id === id) { it.userPriority = Math.max(it.userPriority, priority); return true; } }
-    return false;
-  }
-
-  async unpin(id: string): Promise<boolean> {
-    for (const it of [...this.C, ...this.N]) { if (it.id === id) { it.userPriority = 0; return true; } }
-    return false;
-  }
-
-  exportState() {
-    return { turnIdx: this.turnIdx, budgets: this.budgets, weights: this.w, ttlTurns: this.ttlTurns, N: this.N, C: this.C, O: this.O };
-  }
+  const out: MemoryItem[]=[]; let run=0; for (const it of copy){ const t=tk(it); if(run+t>B) break; out.push(it); run+=t; }
+  return out;
 }
+
+export const retrieveFromO = async (state: State, query: string, k=5) => {
+  const bag = new Set(toWordsLowerASCII(query));
+  const sc = state.O.map(m=>{
+    const text = [m.topic, m.summary256, ...m.salienceTags, ...m.rehydrationHints].join(' ').toLowerCase();
+    const words = new Set(toWordsLowerASCII(text)); let overlap=0; for(const w of words) if(bag.has(w)) overlap++;
+    return { m, s: overlap };
+  }).sort((a,b)=>b.s-a.s);
+  return sc.filter(x=>x.s>0).slice(0,k).map(x=>x.m);
+};
+
+export async function manifestFromItems(state: State, items: MemoryItem[], topicHint=""): Promise<EpisodeManifest> {
+  const concat = items.map(x=>x.content).join(NL+NL);
+  const { text } = await state.trimFn(concat, 256, "OLD", "high");
+  const tags = Array.from(new Set(items.flatMap(x=>x.tags))).sort();
+  const size = items.reduce((s,x)=>s+state.tok.count(x.content),0);
+  return { episodeId: uid(), topic: topicHint || (tags[0]||"episode"), dateRange: [isoDate(), isoDate()],
+    summary256: text, salienceTags: tags, links: [], rehydrationHints: tags.slice(0,8), sizeEstimateTokens: size,
+    createdTs: nowSec(), lastUpdatedTs: nowSec() };
+}
+
+export async function archiveEvicted(state: State, evicted: MemoryItem[], topicHint=""): Promise<State> {
+  if (!evicted.length) return state;
+  const m = await manifestFromItems(state, evicted, topicHint);
+  return { ...state, O: [...state.O, m] };
+}
+
+// ---------- Public API ----------
+export function initState(params: { budgets: Budgets; tok?: Tokenizer; weights?: ScoringWeights; ttlTurns?: number; trimFn: State["trimFn"]; }): State {
+  const { budgets, tok=defaultTokenizer, weights=defaultWeights, ttlTurns=8, trimFn } = params;
+  return { turnIdx: 0, N: [], C: [], O: [], budgets, tok, w: weights, ttlTurns, trimFn };
+}
+
+export async function turn(state: State, params: { userMsg?: string; toolOutputs?: string[]; query?: string; pullFromO?: boolean; kRetrieve?: number; topicHint?: string; }): Promise<{ state: State; forLLM: string; }>{
+  let s = { ...state, turnIdx: state.turnIdx + 1 };
+  const userMsg = params.userMsg ?? ''; const toolOutputs = params.toolOutputs ?? [];
+  const query = params.query ?? ''; const pullFromO = params.pullFromO ?? true;
+  const kRetrieve = params.kRetrieve ?? 4; const topicHint = params.topicHint ?? '';
+
+  let N = ingest(s, [userMsg, ...toolOutputs]);
+  N = N.map(n=>({ ...n, lastTouchedTurn: s.turnIdx, lastTouchedTs: nowSec(), frequency: n.frequency+1 }));
+  N = await llmTrimItems(s, N, s.budgets.B_N, "NEW", "high");
+
+  if (pullFromO && query){
+    const manifests = await retrieveFromO(s, query, kRetrieve);
+    if (manifests.length){
+      const text = manifests.map(m=>`[${m.topic}] ${m.summary256}`).join(NL);
+      const R = ingest(s, [text], ["rehydrated"]);
+      N = await llmTrimItems(s, [...N, ...R], s.budgets.B_N, "NEW", "high");
+    }
+  }
+
+  const candidates = uniq([...s.C, ...N]).filter(it => it.userPriority >= 1 || (s.turnIdx - it.lastTouchedTurn) <= s.ttlTurns);
+  const sorted = [...candidates].sort((a,b)=>score(s,b)-score(s,a));
+  const packed: MemoryItem[] = []; let used=0;
+  for (const it of sorted){ const t = s.tok.count(it.content); if (used + t <= s.budgets.B_C){ packed.push(it); used += t; } }
+  let C = packed; if (used > s.budgets.B_C){ C = await llmTrimItems(s, packed, s.budgets.B_C, "CURRENT", "low"); }
+
+  const prevIds = new Set(s.C.map(x=>x.id));
+  const nextIds = new Set(C.map(x=>x.id));
+  const evicted = s.C.filter(x=>!nextIds.has(x.id));
+  s = await archiveEvicted(s, evicted, topicHint);
+
+  s = { ...s, N, C };
+  const forLLM = [...s.C, ...s.N].map(x=>x.content).join(NL+NL);
+  return { state: s, forLLM };
+}
+
+export async function pin(state: State, id: string, priority=1): Promise<State>{
+  const upd = (arr: MemoryItem[]) => arr.map(it => it.id===id ? { ...it, userPriority: Math.max(it.userPriority, priority) } : it);
+  return { ...state, N: upd(state.N), C: upd(state.C) };
+}
+
+export async function unpin(state: State, id: string): Promise<State>{
+  const upd = (arr: MemoryItem[]) => arr.map(it => it.id===id ? { ...it, userPriority: 0 } : it);
+  return { ...state, N: upd(state.N), C: upd(state.C) };
+}
+
+export function exportState(state: State){ return state; }
 ```
 
-**Plug‑in points.** Replace `Tokenizer` with your model’s tokenizer, implement `LLMFn` for your provider, and persist `EpisodeManifest` objects in your database or object store. The class returns a `forLLM` string ready to be appended to your system/instruction prompt.
+### 5.1 Code Documentation -  What / Why / How
 
----
+* **`initState`** *(WHAT)* creates a fresh immutable state with budgets, tokenizer, weights, TTL, and a `trimFn`. *(WHY)* Centralizes config; enables pure functional flow. *(HOW)* Returns a `State` object; you can serialize it directly.
+* **`makeTrimFn`** *(WHAT)* builds a tier‑aware LLM trimming function. *(WHY)* LLM decides what to keep/remove per tier. *(HOW)* Sends a system+user prompt; if the model overshoots, a guard enforces the token target.
+* **`ingest`** *(WHAT)* converts raw strings to `MemoryItem`s. *(WHY)* Normalize inputs from user and tools. *(HOW)* Adds IDs, timestamps, tags.
+* **`llmTrimItems`** *(WHAT)* compresses a set of items to fit a token budget. *(WHY)* Bound prompt size. *(HOW)* Iteratively trims largest items with LLM, then proportionally; prefix‑packs if still oversized.
+* **`retrieveFromO`** *(WHAT)* retrieves episode manifests by keyword overlap. *(WHY)* Cheap baseline to rehydrate history. *(HOW)* Scores overlap on {topic, summary, tags, hints}; replace with vector/BM25 later.
+* **`manifestFromItems`** *(WHAT)* creates an **episode manifest** for evicted items. *(WHY)* Keep archive compact and searchable. *(HOW)* LLM summarizes to ~256 tokens, extracts tags/hints.
+* **`archiveEvicted`** *(WHAT)* appends a new manifest to `O`. *(WHY)* Preserve value from evictions for future rehydration. *(HOW)* Calls `manifestFromItems` and updates state immutably.
+* **`score`** *(WHAT)* ranks items for the working set. *(WHY)* Deterministic, budgeted packing of (C_t). *(HOW)* Combines recency, frequency, user priority, dependency alignment, and size penalty.
+* **`turn`** *(WHAT)* runs one conversation turn. *(WHY)* Advance state with strict budgets and caching semantics. *(HOW)* `N_t` via ingest+trim (+rehydration), `C_t` via scored pack (+trim), evictions → `O_t` manifests. Returns `{ state, forLLM }`.
+* **`pin`/`unpin`** *(WHAT)* user‑controlled retention. *(WHY)* Keep critical items in (C_t). *(HOW)* Adjust `userPriority`.
+* **`exportState`** *(WHAT)* serialize. *(WHY)* Save/restore across sessions. *(HOW)* Return the `State` object.
+
+## **Testing tip.** Because everything is pure and returns new state, you can snapshot‑test each step and mock `trimFn` to verify budget behavior deterministically.
 
 ## 6. What This Buys You
 
